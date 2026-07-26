@@ -1,5 +1,9 @@
 # enum
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/donnol/enum.svg)](https://pkg.go.dev/github.com/donnol/enum)
+[![Go Version](https://img.shields.io/badge/Go-%3E%3D1.26-blue)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 零依赖的类型安全枚举库，支持命名值集合、`Struct` 泛型反射构造，以及 `Tree` 递归多级下拉渲染。
 
 ## 快速开始
