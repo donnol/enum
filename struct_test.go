@@ -24,6 +24,34 @@ func TestStruct_InitPopulatesValues(t *testing.T) {
 	}
 }
 
+func TestStruct_PointerEmbed(t *testing.T) {
+	// Embedding *Struct[T] should work the same as embedding Struct[T].
+	type PtrPriorities struct {
+		*enum.Struct[Priority]
+		Low    Priority `enum:"0,低"`
+		Medium Priority `enum:"1,中"`
+		High   Priority `enum:"2,高"`
+	}
+	p := enum.InitFor[Priority, PtrPriorities]()
+
+	// Ensure the struct was populated correctly.
+	if p.Low != 0 || p.Medium != 1 || p.High != 2 {
+		t.Errorf("pointer-embed fields = %d,%d,%d want 0,1,2", p.Low, p.Medium, p.High)
+	}
+	item, ok := p.ByKey("Medium")
+	if !ok || item.Value() != Priority(1) {
+		t.Errorf("ByKey(Medium) = %v,%v want 1,true", item.Value(), ok)
+	}
+	if p.ToMap() == nil {
+		t.Error("ToMap should work with pointer embed")
+	}
+	// JSON round-trip.
+	b, err := json.Marshal(p.Enum())
+	if err != nil || len(b) == 0 {
+		t.Errorf("MarshalJSON with pointer embed: %v", err)
+	}
+}
+
 func TestStruct_ByKey(t *testing.T) {
 	p := enum.InitFor[Priority, Priorities]()
 
@@ -635,7 +663,7 @@ func TestStruct_MarshalJSON_String(t *testing.T) {
 	}
 }
 
-func TestStruct_MarshalJSON_EventTopics(t *testing.T) {
+func TestStruct_MarshalJSON_eventTopics(t *testing.T) {
 	e := enum.InitFor[Endpoint, Endpoints]()
 	b, err := json.Marshal(e.Enum())
 	if err != nil {
@@ -703,7 +731,7 @@ func TestEnum_JSON_UnmarshalString(t *testing.T) {
 	}
 }
 
-func TestEnum_JSON_RoundTrip_EventTopics(t *testing.T) {
+func TestEnum_JSON_RoundTrip_eventTopics(t *testing.T) {
 	evts := enum.InitFor[Endpoint, Endpoints]()
 	b, _ := json.Marshal(evts.Enum())
 	var e enum.Enum[Endpoint]
@@ -772,11 +800,16 @@ func TestEnum_AddExt(t *testing.T) {
 	if !ok || item.Ext()["css"] != "muted" {
 		t.Errorf("ByValue(0).Ext().css = %q, want muted", item.Ext()["css"])
 	}
-	// Unknown item name → no-op, no panic.
-	p.AddExt("NotFound", "x", "y")
-	if p.GetExt("NotFound") != nil {
-		t.Error("GetExt for unknown item should be nil")
-	}
+	// Unknown item name → panic (was silent no-op; a typo'd key would
+	// otherwise hide a bug from the caller).
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("AddExt on unknown item should panic")
+			}
+		}()
+		p.AddExt("NotFound", "x", "y")
+	}()
 }
 
 func TestStruct_TagDisabled(t *testing.T) {
@@ -1077,4 +1110,398 @@ func filterByExtValue[T enum.EnumBase](items []enum.Item[T], key, value string) 
 		}
 	}
 	return out
+}
+
+// ── defensive checks in initStruct ───────────────────────────────────
+
+func TestInitStruct_SkipsUnexportedAnonymousFields(t *testing.T) {
+	// Embed an unexported base type with its own Struct[T] alongside an
+	// exported Struct[T]. The unexported field is skipped (CanInterface
+	// returns false), and the exported one is found.
+	type ignored struct {
+		enum.Struct[string] // unreachable from outer structs reflection
+	}
+	type wrapper struct {
+		ignored                    // unexported anonymous field — skipped by CanInterface
+		enum.Struct[string]        // exported — found after skip
+		A                   string `enum:"1,甲"`
+		B                   string `enum:"2,乙"`
+	}
+
+	w := enum.InitFor[string, wrapper]()
+
+	item, ok := w.ByKey("A")
+	if !ok || item.Value() != "1" {
+		t.Fatalf("ByKey(A) = %v,%v want 1,true", item.Value(), ok)
+	}
+	if w.Len() != 2 {
+		t.Errorf("Len = %d, want 2", w.Len())
+	}
+}
+
+func TestInitStruct_SkipsUnexportedPointerField(t *testing.T) {
+	// Embed an unexported *hidden type. initStruct should skip the
+	// unexported pointer field (CanInterface and CanSet both fail)
+	// and find the exported Struct[int] next.
+	type hidden struct {
+		enum.Struct[int]
+		Alpha int `enum:"0,Alpha"`
+	}
+	type extended struct {
+		*hidden              // unexported pointer — skipped
+		enum.Struct[int]     // exported value — found
+		Beta             int `enum:"1,Beta"`
+		Gamma            int `enum:"2,Gamma"`
+	}
+
+	e := enum.InitFor[int, extended]()
+
+	if e.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", e.Len())
+	}
+	item, ok := e.ByKey("Beta")
+	if !ok || item.Value() != 1 {
+		t.Errorf("ByKey(Beta) = %v,%v want 1,true", item.Value(), ok)
+	}
+	if e.Contains(2) {
+		if !e.Contains(2) {
+			t.Error("should contain Gamma")
+		}
+	}
+}
+
+func TestInitStruct_UnexportedFieldWithOtherExportedEmbed(t *testing.T) {
+	// Same struct, two anonymous fields: one unexported, one exported.
+	// The exported one should be found after skipping the unexported.
+	type hidden struct {
+		enum.Struct[int]
+		X int `enum:"-1,hidden_x"`
+	}
+	type dual struct {
+		hidden               // unexported — skipped
+		enum.Struct[int]     // exported value embed — found
+		Visible          int `enum:"10,visible"`
+	}
+
+	d := enum.InitFor[int, dual]()
+
+	if d.Len() != 1 {
+		t.Fatalf("Len = %d, want 1", d.Len())
+	}
+	item, ok := d.ByKey("Visible")
+	if !ok || item.Value() != 10 {
+		t.Errorf("Visible = %v,%v want 10,true", item.Value(), ok)
+	}
+}
+
+// ── Tree / TreeOptions ─────────────────────────────────────────────
+type eventTopic string
+
+func TestStruct_Tree_FlatEnum(t *testing.T) {
+	// Flat enum (no nested structs) → Tree returns leaf nodes.
+	type Flats struct {
+		enum.Struct[Priority]
+		Low    Priority `enum:"0,低"`
+		Medium Priority `enum:"1,中"`
+	}
+	e := enum.InitFor[Priority, Flats]()
+	tree := e.Tree()
+
+	if len(tree) != 2 {
+		t.Fatalf("flat tree len = %d, want 2", len(tree))
+	}
+	if tree[0].Name != "低" || tree[0].Value != "0" {
+		t.Errorf("tree[0] = {%s, %s}, want {低, 0}", tree[0].Name, tree[0].Value)
+	}
+	if tree[1].Name != "中" || tree[1].Value != "1" {
+		t.Errorf("tree[1] = {%s, %s}, want {中, 1}", tree[1].Name, tree[1].Value)
+	}
+	if len(tree[0].Children) != 0 {
+		t.Error("flat items should have no children")
+	}
+}
+
+func TestStruct_TreeOptions_FlatEnum(t *testing.T) {
+	type Flats struct {
+		enum.Struct[Priority]
+		Low  Priority `enum:"0,低"`
+		High Priority `enum:"2,高,disabled"`
+	}
+	e := enum.InitFor[Priority, Flats]()
+	opts := e.TreeOptions()
+
+	if len(opts) != 2 {
+		t.Fatalf("TreeOptions len = %d, want 2", len(opts))
+	}
+	if opts[0].Label != "低" || opts[0].Value != "0" {
+		t.Errorf("opts[0] = {%s, %s}", opts[0].Label, opts[0].Value)
+	}
+	if !opts[1].Disabled {
+		t.Error("disabled flag not propagated")
+	}
+}
+
+func TestStruct_Tree_NestedOneLevel(t *testing.T) {
+	type Nested struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+			UserAdd  eventTopic `enum:"/user/add,用户新增"`
+		}
+	}
+	e := enum.InitFor[eventTopic, Nested]()
+	tree := e.Tree()
+
+	if len(tree) != 1 {
+		t.Fatalf("tree len = %d, want 1", len(tree))
+	}
+	root := tree[0]
+	if root.Name != "用户管理" || root.Value != "userm" {
+		t.Errorf("root = {%s, %s}, want {用户管理, userm}", root.Name, root.Value)
+	}
+	if len(root.Children) != 2 {
+		t.Fatalf("children = %d, want 2", len(root.Children))
+	}
+	if root.Children[0].Name != "用户列表" {
+		t.Errorf("child[0] = %s, want 用户列表", root.Children[0].Name)
+	}
+	if root.Children[1].Name != "用户新增" {
+		t.Errorf("child[1] = %s, want 用户新增", root.Children[1].Name)
+	}
+}
+
+func TestStruct_Tree_NestedMultiLevel(t *testing.T) {
+	type Deep struct {
+		enum.Struct[eventTopic]
+		China struct {
+			enum.Struct[eventTopic]
+			Self eventTopic `enum:"100,中国"`
+			East struct {
+				enum.Struct[eventTopic]
+				Self     eventTopic `enum:"101,华东"`
+				Shanghai eventTopic `enum:"10101,上海"`
+			}
+		}
+	}
+	e := enum.InitFor[eventTopic, Deep]()
+	tree := e.Tree()
+
+	if len(tree) != 1 {
+		t.Fatalf("tree len = %d, want 1", len(tree))
+	}
+	china := tree[0]
+	if china.Name != "中国" {
+		t.Errorf("root = %s, want 中国", china.Name)
+	}
+	if len(china.Children) != 1 {
+		t.Fatalf("china children = %d, want 1", len(china.Children))
+	}
+	east := china.Children[0]
+	if east.Name != "华东" {
+		t.Errorf("east = %s, want 华东", east.Name)
+	}
+	if len(east.Children) != 1 {
+		t.Fatalf("east children = %d, want 1", len(east.Children))
+	}
+	if east.Children[0].Name != "上海" {
+		t.Errorf("shanghai = %s, want 上海", east.Children[0].Name)
+	}
+}
+
+func TestStruct_Tree_NestedPlusFlat(t *testing.T) {
+	// Mix: nested struct + flat top-level items.
+	type Mixed struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+		}
+		UserCreated eventTopic `enum:"user.created,用户创建"`
+	}
+	e := enum.InitFor[eventTopic, Mixed]()
+	tree := e.Tree()
+
+	if len(tree) != 2 {
+		t.Fatalf("tree len = %d, want 2", len(tree))
+	}
+	// Order should be: UserManage (nested struct) then UserCreated (flat).
+	if tree[0].Name != "用户管理" {
+		t.Errorf("tree[0] = %s, want 用户管理", tree[0].Name)
+	}
+	if tree[1].Name != "用户创建" {
+		t.Errorf("tree[1] = %s, want 用户创建", tree[1].Name)
+	}
+}
+
+func TestStruct_TreeOptions_NestedOneLevel(t *testing.T) {
+	type Nested struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+		}
+	}
+	e := enum.InitFor[eventTopic, Nested]()
+	opts := e.TreeOptions()
+
+	if len(opts) != 1 {
+		t.Fatalf("TreeOptions len = %d, want 1", len(opts))
+	}
+	if opts[0].Label != "用户管理" {
+		t.Errorf("label = %s, want 用户管理", opts[0].Label)
+	}
+	if opts[0].Value != "userm" {
+		t.Errorf("value = %s, want userm", opts[0].Value)
+	}
+	if len(opts[0].Children) != 1 {
+		t.Fatalf("children = %d, want 1", len(opts[0].Children))
+	}
+	if opts[0].Children[0].Label != "用户列表" {
+		t.Errorf("child label = %s, want 用户列表", opts[0].Children[0].Label)
+	}
+}
+
+func TestStruct_All_ContainsNestedItems(t *testing.T) {
+	// All() should return flat items including nested ones.
+	type Mixed struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+		}
+		UserCreated eventTopic `enum:"user.created,用户创建"`
+	}
+	e := enum.InitFor[eventTopic, Mixed]()
+
+	all := e.All()
+	if len(all) != 3 {
+		t.Fatalf("All len = %d, want 3", len(all))
+	}
+	if e.Len() != 3 {
+		t.Errorf("Len = %d, want 3", e.Len())
+	}
+	// Verify ByValue works for nested items too.
+	if _, ok := e.ByValue(eventTopic("userm")); !ok {
+		t.Error("ByValue(userm) should find nested item")
+	}
+}
+
+func TestStruct_Tree_JSON(t *testing.T) {
+	type Nested struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+		}
+	}
+	e := enum.InitFor[eventTopic, Nested]()
+	b, err := json.Marshal(e.Tree())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodes []enum.TreeNode
+	if err := json.Unmarshal(b, &nodes); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "用户管理" {
+		t.Error("Tree JSON round-trip failed")
+	}
+}
+
+func TestStruct_TreeOptions_JSON(t *testing.T) {
+	type Nested struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			UserList eventTopic `enum:"/user/list,用户列表"`
+		}
+	}
+	e := enum.InitFor[eventTopic, Nested]()
+	b, err := json.Marshal(e.TreeOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var opts []enum.CascaderOption
+	if err := json.Unmarshal(b, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(opts) != 1 || opts[0].Label != "用户管理" {
+		t.Error("TreeOptions JSON round-trip failed")
+	}
+}
+
+func TestStruct_Tree_MatchesEventEmbedsPattern(t *testing.T) {
+	// Match the EventEmbeds pattern from event.go:
+	//   UserManage struct {
+	//       Self     eventTopic `enum:"userm,用户管理"`
+	//       Children struct {
+	//           UserList eventTopic `enum:"/user/list,用户列表"`
+	//       }
+	//   }
+	// Self is the tree root; Children items are nested under it.
+	type Nested struct {
+		enum.Struct[eventTopic]
+		UserManage struct {
+			enum.Struct[eventTopic]
+			Self     eventTopic `enum:"userm,用户管理"`
+			Children struct {
+				enum.Struct[eventTopic]
+				UserList eventTopic `enum:"/user/list,用户列表"`
+				UserAdd  eventTopic `enum:"/user/add,用户新增"`
+			}
+		}
+	}
+	e := enum.InitFor[eventTopic, Nested]()
+
+	// === value ===
+
+	if e.UserManage.Self != "userm" {
+		t.Errorf("e.UserManage.Self = %s, want userm", e.UserManage.Self)
+	}
+	if e.UserManage.Children.UserList != "/user/list" {
+		t.Errorf("e.UserManage.Children.UserList = %s, want /user/list", e.UserManage.Children.UserList)
+	}
+	if e.UserManage.Children.UserAdd != "/user/add" {
+		t.Errorf("e.UserManage.Children.UserAdd = %s, want /user/add", e.UserManage.Children.UserAdd)
+	}
+
+	// === by value ===
+
+	if v, want := e.MustByValue(e.UserManage.Self), "UserManage.Self"; v.Key() != want || v.Value() != "userm" || v.Name() != "用户管理" {
+		t.Errorf("UserManage.value = %s, want %s, item: %+v", v.Key(), want, v)
+	}
+	if v, want := e.MustByValue(e.UserManage.Children.UserList), "UserManage.Children.UserList"; v.Key() != want || v.Value() != "/user/list" || v.Name() != "用户列表" {
+		t.Errorf("UserManage.value = %s, want %s, item: %+v", v.Key(), want, v)
+	}
+	if v, want := e.MustByValue(e.UserManage.Children.UserAdd), "UserManage.Children.UserAdd"; v.Key() != want || v.Value() != "/user/add" || v.Name() != "用户新增" {
+		t.Errorf("UserManage.value = %s, want %s, item: %+v", v.Key(), want, v)
+	}
+
+	// === tree ===
+
+	tree := e.Tree()
+
+	if len(tree) != 1 {
+		t.Fatalf("tree len = %d, want 1", len(tree))
+	}
+	root := tree[0]
+	if root.Name != "用户管理" {
+		t.Errorf("root = %s, want 用户管理", root.Name)
+	}
+	if len(root.Children) != 2 {
+		t.Fatalf("children = %d, want 2 (UserList + UserAdd)", len(root.Children))
+	}
+	if root.Children[0].Name != "用户列表" {
+		t.Errorf("child[0] = %s, want 用户列表", root.Children[0].Name)
+	}
+	if root.Children[1].Name != "用户新增" {
+		t.Errorf("child[1] = %s, want 用户新增", root.Children[1].Name)
+	}
 }

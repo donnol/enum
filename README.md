@@ -46,7 +46,7 @@ p := enum.InitFor[Priority, Priorities]()
 
 ### `Enum[T]` — 枚举集合
 
-有序、逻辑不可变（只有 ext 可写）。并发读安全（`AddExt` 与读调用不并发时）。
+有序、逻辑不可变（只有 ext 可写）。并发读安全；`AddExt` 修改 ext 元数据，**不得与读操作并发**（否则可能 `concurrent map writes`）。`Struct[T].AddExt` 同样受此约束。
 
 | 方法 | 说明 |
 |------|------|
@@ -96,6 +96,15 @@ events.ByKey("UserCreated") // Item[string], true
 events.All()                // []Item[string]
 events.Enum().MarshalJSON() // JSON
 ```
+
+> **⚠️ JSON 序列化注意**：外层 struct 只要有自己的字段（不止嵌入 `Struct[T]`），Go 的
+> `encoding/json` 就会**忽略内嵌的 `MarshalJSON`/`UnmarshalJSON`**，序列化结果会是
+> `{"enum":null,"UserCreated":""}` 这种。此时必须显式用 `.Enum()`：
+> `json.NewEncoder(w).Encode(events.Enum())`。
+>
+> **⚠️ `UnmarshalJSON` 只重建内部枚举**：它更新 `Enum` 的数据，但**不会**更新外层
+> struct 的常量字段（`events.UserCreated` 等仍保持旧值）。反序列化后如需字段同步，请重新
+> `InitFor`。
 
 ### `TreeNode` / `BuildTree` / `AsStringItems` — 多级下拉
 
@@ -179,13 +188,151 @@ type MyEnums struct {
 }
 
 // 2. 初始化
-var E = enum.InitFor[MyEnum, MyEnums]()
+e := enum.InitFor[MyEnum, MyEnums]()
 
-// 3. 使用 E
+// 3. 使用
+switch v {
+case e.Alpha:
+case e.Beta:
+}
 ```
+
+## 配合 lint 工具（只读保护）
+
+`enum.InitFor` 返回的结构体字段是**导出的**，运行期可以被改写（如 `Events.UserCreated = "x"`），
+破坏枚举的只读语义。配套 lint 工具（`lint`，包 `lint/`，CLI `cmd/enumlint/`）
+用静态分析扫描整个模块，找出所有对枚举变量或其字段的**写入**，把这类 bug 挡在提交前。
+
+### 运行
+
+```bash
+# 在模块根目录（有 go.mod 的地方）
+go run ./cmd/enumlint/ ./...
+# 或安装为全局命令
+go install github.com/donnol/enum/cmd/enumlint@latest && enumlint ./...
+```
+
+**指定 enum 包路径**：工具会自动发现声明 `InitFor` 的包；若 enum 是外部依赖且自动发现不到，
+用 `-enum-pkg` 显式指定：
+
+```bash
+go run ./cmd/enumlint/ -enum-pkg github.com/donnol/enum ./...
+```
+
+无违规：exit 0，输出 `✅ enum check is good 🌟`。
+
+发现违规：exit 1，输出违规表格（`路径:行号` 可直接点击跳转）：
+
+```
+🚨 enum check is bad 💥
+Location                          Kind   Target
+--------                          ----   ------
+server/biz/order/foo.go:6         field  event.Events.UserCreated
+server/biz/order/foo.go:20        variable  Events
+⚠️  请修正后重试！
+```
+
+### 检测规则
+
+- 只追踪**包级** `var X = enum.InitFor[T, struct{...}]()` 声明的枚举（须限定为 enum 包的 `InitFor`，同名其他函数不误报）
+- 检测以下写入：
+  - `X = ...` — 整体重写枚举变量
+  - `X.Field = ...` / `X.Field += ...` — 字段赋值、复合赋值
+  - `X.Field++` / `X.Field--` — 自增自减
+  - 跨包写入 `pkg.X.Field = ...` 同样检测
+- `X := ...`（短声明）视为局部声明，不误报；**函数内局部 shadow 只在自身函数内生效**，不影响其他函数对包级枚举的检测
+- 支持自定义 import 别名（`import myenum "…/enum"`）
+
+### 已知限制
+
+- 只检测包级枚举；函数内局部 `enum.InitFor` 不追踪 -- 函数内作用范围小，可自行检查
+- 不校验枚举**定义**的正确性（重复 value、非法 tag、缺嵌入 `Struct[T]` 等仍要到运行时 panic）
+- 通过指针间接修改（`f(&Events.Field)`）无法静态检测
+- `_test.go` 同样受约束（测试代码也不应改写枚举）
 
 ## 设计原则
 
 - 零外部依赖 — 仅使用 Go 标准库
 - enum tag 格式：`"value,name[,disabled]"` — 第三段 `"disabled"` 标记为仅展示不可选
 - 没有 `init()` — 枚举显式构造，无隐式副作用
+
+## ts
+
+```go
+type Priority int
+
+type Priorities struct {
+    enum.Struct[Priority]
+    Low    Priority `enum:"0,低"`
+    Medium Priority `enum:"1,中"`
+    High   Priority `enum:"2,高,disabled"`
+}
+```
+
+用 enum.InitFor 后，Enum.MarshalJSON 的数组元素是：
+
+```json
+{"key":"Low","name":"低","value":0}
+{"key":"Medium","name":"中","value":1}
+{"key":"High","name":"高","disabled":true,"value":2}
+```
+
+1. 对应的 TS as const 枚举数据
+
+```js
+export const PRIORITIES = {
+  Low: {
+    key: 'Low' as const,
+    name: '低' as const,
+    value: 0 as const,
+  },
+  Medium: {
+    key: 'Medium' as const,
+    name: '中' as const,
+    value: 1 as const,
+  },
+  High: {
+    key: 'High' as const,
+    name: '高' as const,
+    value: 2 as const,
+    disabled: true as const,
+  },
+} as const;
+```
+
+这就是「ts {...} as const」部分：每一项有 key / name / value / disabled?，和 Go 侧 JSON 结构一一对应。
+
+2. 从 as const 中取出 key / value 相关类型
+
+```js
+// 所有枚举项的联合类型
+export type PriorityItem = (typeof PRIORITIES)[keyof typeof PRIORITIES];
+
+// key 的字面量联合："Low" | "Medium" | "High"
+export type PriorityKey = PriorityItem['key'];
+
+// value 的字面量联合：0 | 1 | 2
+export type PriorityValue = PriorityItem['value'];
+```
+
+如果你只想要一个「key 到 value」的简单映射结构，可以再包一层：
+
+```js
+// key -> value 的映射对象类型
+export type PriorityKeyValueMap = {
+  [K in PriorityKey]: Extract<PriorityItem, { key: K }>['value'];
+};
+
+// 实例：由 PRIORITIES 推导出的 key/value map
+export const PRIORITY_KEY_VALUE: PriorityKeyValueMap = {
+  Low: PRIORITIES.Low.value,
+  Medium: PRIORITIES.Medium.value,
+  High: PRIORITIES.High.value,
+};
+```
+
+这样你就同时有：
+
+- PRIORITIES：完整的枚举元数据（key/name/value/disabled）——对应 Go 侧 Enum.MarshalJSON 的数组元素结构；
+- PriorityKey / PriorityValue：类型级别的 key/value 联合；
+- PRIORITY_KEY_VALUE：在 TS 里方便用的「key → value」映射。

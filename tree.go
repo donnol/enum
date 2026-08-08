@@ -11,6 +11,15 @@ type TreeNode struct {
 	Children []TreeNode `json:"children,omitempty"`
 }
 
+// CascaderOption is the Ant Design <Cascader> / <TreeSelect> format,
+// using label instead of name. Produced by Struct[T].TreeOptions().
+type CascaderOption struct {
+	Label    string            `json:"label"`
+	Value    string            `json:"value"`
+	Disabled bool              `json:"disabled,omitempty"`
+	Children []CascaderOption  `json:"children,omitempty"`
+}
+
 // BuildTree converts a flat item list into a recursive tree keyed by
 // ext["parent"]. Items without a parent (or whose parent doesn't match
 // any item) become roots.

@@ -239,10 +239,12 @@ func (e *Enum[T]) Range() iter.Seq2[string, Item[T]] {
 // No-op when the item is not found. The item's ext map is created on
 // first use. Updates both the items slice and the lookup maps so
 // subsequent ByKey/ByValue calls reflect the change.
+// Panics if the item does not exist — a typo'd key would otherwise be
+// silently ignored, hiding a bug from the caller.
 func (e *Enum[T]) AddExt(itemKey, extKey, extValue string) {
 	idx, ok := e.keyOffset[itemKey]
 	if !ok {
-		return
+		panic(fmt.Sprintf("enum.AddExt: item %q not found", itemKey))
 	}
 	if e.items[idx].ext == nil {
 		e.items[idx].ext = map[string]string{extKey: extValue}
@@ -279,13 +281,22 @@ func (e *Enum[T]) ToMap() map[string]map[string]any {
 		if it.disabled {
 			entry[DisabledKey] = true
 		}
-		if len(it.ext) > 0 {
-			entry[ExtKey] = it.ext
+		if ext := it.Ext(); len(ext) > 0 {
+			entry[ExtKey] = ext
 		}
 		m[it.key] = entry
 	}
 	return m
 }
+
+// ConvertValues return []R by to. Can be used >= go1.27
+// func (e *Enum[T]) ConvertValues[R any](to func(T) R) []R {
+// 	r := make([]R, 0, e.Len())
+// 	for _, item := range e.Range() {
+// 		r = append(r, to(item.Value()))
+// 	}
+// 	return r
+// }
 
 // ── JSON ──────────────────────────────────────────────────────────────
 
@@ -306,7 +317,8 @@ func (e *Enum[T]) MarshalJSON() ([]byte, error) {
 			Name:     it.name,
 			Value:    it.value,
 			Disabled: it.disabled,
-			Ext:      it.ext,
+			// Copy via Ext() to read a snapshot instead of the live map.
+			Ext: it.Ext(),
 		}
 	}
 	return json.Marshal(items)
