@@ -113,6 +113,15 @@ func TestCrossPackageWrite(t *testing.T) {
 	if !strings.Contains(got, "enumdef.Statuses.Pending") {
 		t.Errorf("missing cross-package field-write violation\n%s", got)
 	}
+	var foundVarWrite bool
+	for _, v := range violations {
+		if strings.Contains(v, "variable") && strings.Contains(v, "enumdef.Statuses") {
+			foundVarWrite = true
+		}
+	}
+	if !foundVarWrite {
+		t.Errorf("missing cross-package variable-reassign violation\n%s", got)
+	}
 }
 
 func TestIncDecStmtFlagged(t *testing.T) {
@@ -624,7 +633,7 @@ func InitFor() int { return 1 }
 
 func TestRunAPIClean(t *testing.T) {
 	chdirToModuleRoot(t)
-	report, n, err := Run(Config{Roots: []string{testdataDir + "/good"}})
+	report, n, warn, err := Run(Config{Roots: []string{testdataDir + "/good"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,11 +643,14 @@ func TestRunAPIClean(t *testing.T) {
 	if report != "" {
 		t.Errorf("clean run report = %q, want empty", report)
 	}
+	if warn != "" {
+		t.Errorf("clean run warn = %q, want empty", warn)
+	}
 }
 
 func TestRunAPIDirty(t *testing.T) {
 	chdirToModuleRoot(t)
-	report, n, err := Run(Config{Roots: []string{testdataDir + "/bad"}})
+	report, n, _, err := Run(Config{Roots: []string{testdataDir + "/bad"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +665,7 @@ func TestRunAPIDirty(t *testing.T) {
 func TestRunAPIExplicitEnumPkg(t *testing.T) {
 	chdirToModuleRoot(t)
 	// With an explicit enum-pkg that does NOT match, nothing is tracked.
-	_, n, err := Run(Config{
+	_, n, warn, err := Run(Config{
 		Roots:   []string{testdataDir + "/bad"},
 		EnumPkg: "example.com/other-enum",
 	})
@@ -662,5 +674,29 @@ func TestRunAPIExplicitEnumPkg(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("explicit non-matching enum-pkg: n = %d, want 0", n)
+	}
+	// The package is nowhere in the scanned module — a typo should be
+	// surfaced as a warning instead of silently passing.
+	if !strings.Contains(warn, "not found") || !strings.Contains(warn, "example.com/other-enum") {
+		t.Errorf("expected not-found warning for explicit enum-pkg, got %q", warn)
+	}
+}
+
+func TestRunAPIExplicitEnumPkgFound(t *testing.T) {
+	chdirToModuleRoot(t)
+	// The real enum package is imported by the testdata fixtures, so an
+	// explicit -enum-pkg pointing at it must produce no warning.
+	_, n, warn, err := Run(Config{
+		Roots:   []string{testdataDir + "/bad"},
+		EnumPkg: "github.com/donnol/enum",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("explicit matching enum-pkg should still detect violations")
+	}
+	if warn != "" {
+		t.Errorf("explicit matching enum-pkg produced warning %q, want empty", warn)
 	}
 }

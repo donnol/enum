@@ -219,6 +219,8 @@ go install github.com/donnol/enum/cmd/enumlint@latest && enumlint ./...
 go run ./cmd/enumlint/ -enum-pkg github.com/donnol/enum ./...
 ```
 
+若显式指定的 `-enum-pkg` 在扫描范围内找不到（既不是被扫描的包，也没有任何扫描文件 import 它），
+会向 stderr 输出一条警告，提示检查 `-enum-pkg` 是否输入错误；此时不会误报违规，但值得核实。
 无违规：exit 0，输出 `✅ enum check is good 🌟`。
 
 发现违规：exit 1，输出违规表格（`路径:行号` 可直接点击跳转）：
@@ -239,7 +241,7 @@ server/biz/order/foo.go:20        variable  Events
   - `X = ...` — 整体重写枚举变量
   - `X.Field = ...` / `X.Field += ...` — 字段赋值、复合赋值
   - `X.Field++` / `X.Field--` — 自增自减
-  - 跨包写入 `pkg.X.Field = ...` 同样检测
+  - 跨包写入 `pkg.X.Field = ...`、`pkg.X = ...`（重写另一包枚举变量）同样检测
 - `X := ...`（短声明）视为局部声明，不误报；**函数内局部 shadow 只在自身函数内生效**，不影响其他函数对包级枚举的检测
 - 支持自定义 import 别名（`import myenum "…/enum"`）
 

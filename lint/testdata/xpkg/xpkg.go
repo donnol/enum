@@ -8,6 +8,12 @@ func badWrite() {
 	enumdef.Statuses.Pending = "hacked"
 }
 
+func badVarWrite() {
+	// Reassigning the enum variable itself through the package qualifier
+	// must also be flagged.
+	enumdef.Statuses = "hacked"
+}
+
 func aliasedWrite() {
 	// Custom alias import would be a separate file; here we use the
 	// default alias (package name = enumdef).

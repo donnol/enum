@@ -36,25 +36,55 @@ type Config struct {
 }
 
 // Run lints the configured roots and returns the formatted report ("" if
-// clean) and the number of violations.
-func Run(cfg Config) (report string, n int, err error) {
+// clean), the number of violations, and a warning ("" when nothing to warn
+// about). The warning fires when an explicit EnumPkg is configured but the
+// package could not be located during the scan — a likely typo in -enum-pkg.
+func Run(cfg Config) (report string, n int, warn string, err error) {
 	roots, err := resolveRoots(cfg.Roots)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	if len(roots) == 0 {
-		return "", 0, nil
+		return "", 0, "", nil
 	}
 	c := newChecker(roots)
 	c.enumPkg = cfg.EnumPkg
 	if err := c.scan(); err != nil {
-		return "", 0, err
+		return "", 0, "", err
+	}
+	if cfg.EnumPkg != "" && !c.enumPkgFound() {
+		warn = fmt.Sprintf("⚠️  enum package %q not found in the scanned module — 请检查 -enum-pkg 是否输入错误", cfg.EnumPkg)
 	}
 	violations := c.report()
 	if len(violations) == 0 {
-		return "", 0, nil
+		return "", 0, warn, nil
 	}
-	return strings.Join(violations, "\n"), len(violations), nil
+	return strings.Join(violations, "\n"), len(violations), warn, nil
+}
+
+// enumPkgFound reports whether the configured enum package was located
+// during the scan. A package counts as found either when it appears among
+// the scanned files itself, or when at least one scanned file imports it
+// (the case for an external enum module pulled in as a dependency). It
+// always returns true when no explicit enum-pkg is configured, since the
+// discovery/fallback paths are authoritative by construction.
+func (c *checker) enumPkgFound() bool {
+	if c.enumPkg == "" {
+		return true
+	}
+	for _, p := range c.fileImportPath {
+		if p == c.enumPkg {
+			return true
+		}
+	}
+	for _, imps := range c.imports {
+		for _, info := range imps {
+			if info.path == c.enumPkg {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // enumIdent records a discovered enum variable (via enum.InitFor) along with
@@ -541,6 +571,22 @@ func (c *checker) checkWriteExpr(expr ast.Expr, filePkg, fileAbs string, pos tok
 
 func (c *checker) checkFieldWrite(sel *ast.SelectorExpr, filePkg, fileAbs string, pos token.Pos, local map[string]bool) {
 	field := sel.Sel.Name
+
+	// Case 0: pkgAlias.Var = ... — a write to the enum variable itself
+	// through a package qualifier (e.g. `role.Permissions = ...`).
+	if x, ok := sel.X.(*ast.Ident); ok && !local[x.Name] {
+		importedPkg := c.resolveImport(fileAbs, x.Name)
+		for _, en := range c.enums {
+			if en.variable == field && en.importPath == importedPkg {
+				c.violations = append(c.violations, violation{
+					pos:    c.fset.Position(pos),
+					kind:   "variable",
+					target: x.Name + "." + en.variable,
+				})
+				return
+			}
+		}
+	}
 
 	// Case 1: X.Field — X is a simple ident in the same package.
 	if x, ok := sel.X.(*ast.Ident); ok {

@@ -26,10 +26,14 @@ func main() {
 		cfg.Roots = []string{"."}
 	}
 
-	report, n, err := enumlint.Run(cfg)
+	report, n, warn, err := enumlint.Run(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "enumlint:", err)
 		os.Exit(1)
+	}
+	if warn != "" {
+		fmt.Fprintln(os.Stderr, warn)
+		return
 	}
 	if n == 0 {
 		fmt.Println("\033[32m✅ enum check is good 🌟\033[0m")
