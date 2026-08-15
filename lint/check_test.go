@@ -174,6 +174,38 @@ func TestLowercaseFieldNotTracked(t *testing.T) {
 	}
 }
 
+func TestNamedTypeEnumTracked(t *testing.T) {
+	// testdata/namedtype declares the enum via a named struct type
+	// (enum.InitFor[T, Statuses]()). All.Active = ... must be flagged;
+	// writes to NotAnEnum (a plain struct, not built by InitFor) must not.
+	violations := runChecker(t, "namedtype")
+	got := strings.Join(violations, "\n")
+	if !strings.Contains(got, "All.Active") {
+		t.Errorf("missing field-write violation for named-type enum\n%s", got)
+	}
+	for _, v := range violations {
+		if strings.Contains(v, "NotAnEnum") {
+			t.Errorf("false positive on non-enum named struct: %s", v)
+		}
+	}
+}
+
+func TestIIFEEnumTracked(t *testing.T) {
+	// testdata/iife builds the enum inside an IIFE (InitFor + AddExt at
+	// construction time). All.Active = ... must be flagged; writes to
+	// NotEnum (a plain IIFE without InitFor) must not.
+	violations := runChecker(t, "iife")
+	got := strings.Join(violations, "\n")
+	if !strings.Contains(got, "All.Active") {
+		t.Errorf("missing field-write violation for IIFE enum\n%s", got)
+	}
+	for _, v := range violations {
+		if strings.Contains(v, "NotEnum") {
+			t.Errorf("false positive on non-enum IIFE: %s", v)
+		}
+	}
+}
+
 // ─── Helper function unit tests ────────────────────────────────────────
 
 func TestExportedFieldsOnlyPascalCase(t *testing.T) {
@@ -575,7 +607,7 @@ var Fake = other.InitFor[S, struct {
 	absTest, _ := filepath.Abs("test.go")
 	c := newCheckerWithModulePath(nil, "github.com/donnol/enum")
 	c.fset = fset // reuse the same fset so extractImports can resolve positions
-	c.extractImports(f)
+	c.extractImports(f, "")
 	c.findEnumVars(f, "github.com/donnol/enum/p", absTest)
 	// Only `Real` (via myenum alias) resolves to the enum package.
 	if len(c.enums) != 1 {
@@ -698,5 +730,26 @@ func TestRunAPIExplicitEnumPkgFound(t *testing.T) {
 	}
 	if warn != "" {
 		t.Errorf("explicit matching enum-pkg produced warning %q, want empty", warn)
+	}
+}
+
+func TestRunAPINoEnumPackageWarns(t *testing.T) {
+	// testdata/noenum references no enum package at all (no import, no
+	// InitFor declaration). Without -enum-pkg the auto discovery and the
+	// zapp fallback both fail, so the run must warn that checks are
+	// disabled — otherwise the pass would be a silent no-op.
+	chdirToModuleRoot(t)
+	report, n, warn, err := Run(Config{Roots: []string{testdataDir + "/noenum"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0", n)
+	}
+	if report != "" {
+		t.Errorf("report = %q, want empty", report)
+	}
+	if !strings.Contains(warn, "enum package not found") {
+		t.Errorf("expected not-found warning, got %q", warn)
 	}
 }

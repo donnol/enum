@@ -14,7 +14,9 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"unicode"
 )
@@ -22,6 +24,7 @@ import (
 const (
 	// enumInitFor is a keyword to find the enum variable definition like:
 	// 	`var Permissions = enum.InitFor[Permission, struct { ... }]()`
+	// Named struct types and IIFE-wrapped calls are supported too.
 	enumInitFor = "InitFor"
 )
 
@@ -37,8 +40,10 @@ type Config struct {
 
 // Run lints the configured roots and returns the formatted report ("" if
 // clean), the number of violations, and a warning ("" when nothing to warn
-// about). The warning fires when an explicit EnumPkg is configured but the
-// package could not be located during the scan — a likely typo in -enum-pkg.
+// about). The warning fires when the enum package we match against could not
+// be located during the scan — for an explicit EnumPkg that is a likely typo
+// in -enum-pkg; without one it means the enum library is absent, so write
+// checks are silently disabled and the user deserves a heads-up.
 func Run(cfg Config) (report string, n int, warn string, err error) {
 	roots, err := resolveRoots(cfg.Roots)
 	if err != nil {
@@ -52,8 +57,12 @@ func Run(cfg Config) (report string, n int, warn string, err error) {
 	if err := c.scan(); err != nil {
 		return "", 0, "", err
 	}
-	if cfg.EnumPkg != "" && !c.enumPkgFound() {
-		warn = fmt.Sprintf("⚠️  enum package %q not found in the scanned module — 请检查 -enum-pkg 是否输入错误", cfg.EnumPkg)
+	if !c.enumPkgFound() {
+		if cfg.EnumPkg != "" {
+			warn = fmt.Sprintf("⚠️  enum package %q not found in the scanned module — 请检查 -enum-pkg 是否输入错误", cfg.EnumPkg)
+		} else {
+			warn = fmt.Sprintf("⚠️  enum package not found (looked for %q) — enum write checks are disabled", c.enumImportPath())
+		}
 	}
 	violations := c.report()
 	if len(violations) == 0 {
@@ -62,24 +71,22 @@ func Run(cfg Config) (report string, n int, warn string, err error) {
 	return strings.Join(violations, "\n"), len(violations), warn, nil
 }
 
-// enumPkgFound reports whether the configured enum package was located
-// during the scan. A package counts as found either when it appears among
-// the scanned files itself, or when at least one scanned file imports it
-// (the case for an external enum module pulled in as a dependency). It
-// always returns true when no explicit enum-pkg is configured, since the
-// discovery/fallback paths are authoritative by construction.
+// enumPkgFound reports whether the enum package we match against was located
+// during the scan. A package counts as found either when it appears among the
+// scanned files itself, or when at least one scanned file imports it (the
+// case for an external enum module pulled in as a dependency). The path
+// matched is the resolved one: explicit Config.EnumPkg when set, otherwise
+// the discovered package or the zapp fallback.
 func (c *checker) enumPkgFound() bool {
-	if c.enumPkg == "" {
-		return true
-	}
+	path := c.enumImportPath()
 	for _, p := range c.fileImportPath {
-		if p == c.enumPkg {
+		if p == path {
 			return true
 		}
 	}
 	for _, imps := range c.imports {
 		for _, info := range imps {
-			if info.path == c.enumPkg {
+			if info.path == path {
 				return true
 			}
 		}
@@ -88,7 +95,7 @@ func (c *checker) enumPkgFound() bool {
 }
 
 // enumIdent records a discovered enum variable (via enum.InitFor) along with
-// the exported fields of its anonymous struct.
+// the exported fields of its struct (inline anonymous or named).
 type enumIdent struct {
 	variable   string   // e.g. "Events"
 	pkg        string   // package name (short name)
@@ -111,7 +118,8 @@ type importInfo struct {
 
 // checker holds the state for a full-module lint run.
 type checker struct {
-	fset              *token.FileSet
+	fset              *token.FileSet            // shared fallback FileSet (tests / positionFor)
+	fileSets          map[string]*token.FileSet // abs file path → per-file FileSet (parallel parse)
 	dirs              []string
 	modulePath        string                           // e.g. "github.com/donnol/enum", read from go.mod
 	enumPkg           string                           // explicit enum package path (Config.EnumPkg)
@@ -119,6 +127,9 @@ type checker struct {
 	files             map[string]*ast.File             // abs file path → parsed AST (single-pass cache)
 	fileImportPath    map[string]string                // abs file path → import path
 	enums             []enumIdent                      // all enum vars found
+	typeFields        map[string]map[string][]string   // import path → type name → exported fields (index)
+	enumByPkgVar      map[string]map[string]enumIdent  // package name → variable → enum (index)
+	enumByImportVar   map[string]map[string]enumIdent  // import path → variable → enum (index)
 	pkgOf             map[string]string                // file (abs) → package name
 	imports           map[string]map[string]importInfo // file (abs) → alias → import info
 	pkgNameOf         map[string]string                // import path → real package name
@@ -156,13 +167,17 @@ func (c *checker) scan() error {
 		return err
 	}
 	c.discoverEnumPackage()
+	c.indexTypeFields()
 	c.indexFiles()
 	c.fillDefaultAliases()
 	return nil
 }
 
 // parseAll reads every Go file under the configured roots into c.files,
-// recording each file's import path and package name.
+// recording each file's import path and package name. Files are parsed in
+// parallel (bounded by GOMAXPROCS); each file gets its own token.FileSet so
+// the parser never touches shared state. Positions are resolved per file
+// via positionFor.
 func (c *checker) parseAll() error {
 	if c.files == nil {
 		c.files = make(map[string]*ast.File)
@@ -173,6 +188,14 @@ func (c *checker) parseAll() error {
 	if c.pkgNameOf == nil {
 		c.pkgNameOf = make(map[string]string)
 	}
+	if c.fileSets == nil {
+		c.fileSets = make(map[string]*token.FileSet)
+	}
+
+	type fileJob struct {
+		path, abs, importPath string
+	}
+	var jobs []fileJob
 	for _, root := range c.dirs {
 		entries, err := os.ReadDir(root)
 		if err != nil {
@@ -183,17 +206,54 @@ func (c *checker) parseAll() error {
 				continue
 			}
 			fp := filepath.Join(root, e.Name())
-			f, err := parser.ParseFile(c.fset, fp, nil, parser.ParseComments)
-			if err != nil {
-				return fmt.Errorf("parse %s: %w", fp, err)
-			}
 			abs, _ := filepath.Abs(fp)
-			c.files[abs] = f
-			c.fileImportPath[abs] = importPathFor(c.modulePath, root)
-			c.pkgNameOf[c.fileImportPath[abs]] = f.Name.Name
+			jobs = append(jobs, fileJob{path: fp, abs: abs, importPath: importPathFor(c.modulePath, root)})
 		}
 	}
+
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		errs []error
+	)
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j fileJob) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			fs := token.NewFileSet()
+			f, err := parser.ParseFile(fs, j.path, nil, parser.ParseComments)
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("parse %s: %w", j.path, err))
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			c.files[j.abs] = f
+			c.fileSets[j.abs] = fs
+			c.fileImportPath[j.abs] = j.importPath
+			c.pkgNameOf[j.importPath] = f.Name.Name
+			mu.Unlock()
+		}(j)
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		return errs[0]
+	}
 	return nil
+}
+
+// positionFor resolves a token.Pos from a file parsed in parallel using that
+// file's own FileSet, falling back to the shared c.fset.
+func (c *checker) positionFor(fileAbs string, pos token.Pos) token.Position {
+	if fs := c.fileSets[fileAbs]; fs != nil {
+		return fs.Position(pos)
+	}
+	return c.fset.Position(pos)
 }
 
 // importPathFor builds the module import path for a scan root. Absolute
@@ -254,18 +314,20 @@ func (c *checker) enumImportPath() string {
 // indexFiles runs extraction and enum-var discovery over all cached files.
 func (c *checker) indexFiles() {
 	for abs, f := range c.files {
-		c.extractPackage(f)
-		c.extractImports(f)
+		c.extractPackage(f, abs)
+		c.extractImports(f, abs)
 		c.findEnumVars(f, c.fileImportPath[abs], abs)
 	}
 }
 
 // extractPackage records the package name of a file.
-func (c *checker) extractPackage(f *ast.File) {
+func (c *checker) extractPackage(f *ast.File, abs string) {
 	if c.pkgOf == nil {
 		c.pkgOf = make(map[string]string)
 	}
-	abs, _ := filepath.Abs(c.fset.File(f.Pos()).Name())
+	if abs == "" {
+		abs, _ = filepath.Abs(c.fset.File(f.Pos()).Name())
+	}
 	c.pkgOf[abs] = f.Name.Name
 }
 
@@ -273,11 +335,13 @@ func (c *checker) extractPackage(f *ast.File) {
 // no explicit name is inferred as the last path segment; it is corrected
 // to the real package name in fillDefaultAliases once all packages are
 // scanned.
-func (c *checker) extractImports(f *ast.File) {
+func (c *checker) extractImports(f *ast.File, abs string) {
 	if c.imports == nil {
 		c.imports = make(map[string]map[string]importInfo)
 	}
-	abs, _ := filepath.Abs(c.fset.File(f.Pos()).Name())
+	if abs == "" {
+		abs, _ = filepath.Abs(c.fset.File(f.Pos()).Name())
+	}
 	m := c.imports[abs]
 	if m == nil {
 		m = make(map[string]importInfo)
@@ -314,8 +378,12 @@ func (c *checker) fillDefaultAliases() {
 }
 
 // findEnumVars walks the AST of a file looking for package-level var
-// declarations whose value is a call to enum.InitFor[...]() or
-// InitFor[...]().
+// declarations whose value is a call to enum.InitFor[...](), either
+// directly or wrapped in an IIFE:
+//
+//	var A = enum.InitFor[T, struct { ... }]()
+//	var B = enum.InitFor[T, MyCols]()                     // named type
+//	var C = func() MyCols { c := enum.InitFor[T, MyCols](); return c }()
 func (c *checker) findEnumVars(f *ast.File, importDir, fileAbs string) {
 	for _, decl := range f.Decls {
 		gd, ok := decl.(*ast.GenDecl)
@@ -327,44 +395,7 @@ func (c *checker) findEnumVars(f *ast.File, importDir, fileAbs string) {
 			if !ok || len(vs.Values) == 0 {
 				continue
 			}
-			// Look for enum.InitFor[T, struct{...}]() or InitFor[T, struct{...}]()
-			ce, ok := vs.Values[0].(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-			var ix ast.Expr
-			var indices []ast.Expr
-			switch fun := ce.Fun.(type) {
-			case *ast.IndexListExpr:
-				ix = fun.X
-				indices = fun.Indices
-			case *ast.IndexExpr:
-				ix = fun.X
-				indices = []ast.Expr{fun.Index}
-			case *ast.SelectorExpr:
-				if il, ok := fun.X.(*ast.IndexListExpr); ok {
-					ix = il.X
-					indices = il.Indices
-				} else if ie, ok := fun.X.(*ast.IndexExpr); ok {
-					ix = ie.X
-					indices = []ast.Expr{ie.Index}
-				} else {
-					continue
-				}
-			default:
-				continue
-			}
-			if !c.isEnumInitFor(ix, fileAbs) {
-				continue
-			}
-			if len(indices) < 2 {
-				continue
-			}
-			st, ok := indices[1].(*ast.StructType)
-			if !ok {
-				continue
-			}
-			fields := exportedFields(st)
+			fields := c.enumFieldsFromValue(vs.Values[0], f, fileAbs)
 			if len(fields) == 0 {
 				continue
 			}
@@ -378,6 +409,156 @@ func (c *checker) findEnumVars(f *ast.File, importDir, fileAbs string) {
 			}
 		}
 	}
+}
+
+// enumFieldsFromValue extracts the exported enum field names from a
+// package-level var initializer. Supported forms:
+//   - a direct call: enum.InitFor[T, struct{...}]() or InitFor[T, Named]()
+//   - an IIFE:       func() R { ...; c := enum.InitFor[T, ...](); ...; return c }()
+func (c *checker) enumFieldsFromValue(val ast.Expr, f *ast.File, fileAbs string) []string {
+	switch v := val.(type) {
+	case *ast.CallExpr:
+		if fl, ok := v.Fun.(*ast.FuncLit); ok {
+			return c.enumFieldsFromFuncLit(fl, f, fileAbs)
+		}
+		return c.enumFieldsFromInitFor(v, f, fileAbs)
+	case *ast.ParenExpr:
+		return c.enumFieldsFromValue(v.X, f, fileAbs)
+	}
+	return nil
+}
+
+// enumFieldsFromInitFor returns the exported fields of the struct type
+// argument of an enum.InitFor call, or nil when the call is not one.
+func (c *checker) enumFieldsFromInitFor(ce *ast.CallExpr, _ *ast.File, fileAbs string) []string {
+	var ix ast.Expr
+	var indices []ast.Expr
+	switch fun := ce.Fun.(type) {
+	case *ast.IndexListExpr:
+		ix = fun.X
+		indices = fun.Indices
+	case *ast.IndexExpr:
+		ix = fun.X
+		indices = []ast.Expr{fun.Index}
+	case *ast.SelectorExpr:
+		if il, ok := fun.X.(*ast.IndexListExpr); ok {
+			ix = il.X
+			indices = il.Indices
+		} else if ie, ok := fun.X.(*ast.IndexExpr); ok {
+			ix = ie.X
+			indices = []ast.Expr{ie.Index}
+		} else {
+			return nil
+		}
+	default:
+		return nil
+	}
+	if !c.isEnumInitFor(ix, fileAbs) {
+		return nil
+	}
+	if len(indices) < 2 {
+		return nil
+	}
+	return c.structFields(indices[1], fileAbs)
+}
+
+// enumFieldsFromFuncLit finds the enum.InitFor call inside an IIFE body and
+// returns its struct fields. The outermost matching call wins.
+func (c *checker) enumFieldsFromFuncLit(fl *ast.FuncLit, f *ast.File, fileAbs string) []string {
+	var found []string
+	ast.Inspect(fl.Body, func(n ast.Node) bool {
+		if len(found) > 0 {
+			return false
+		}
+		ce, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if fields := c.enumFieldsFromInitFor(ce, f, fileAbs); len(fields) > 0 {
+			found = fields
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// structFields resolves the exported fields of a struct type expression:
+// either an inline StructType or a named type declared in the same package.
+func (c *checker) structFields(typ ast.Expr, fileAbs string) []string {
+	switch t := typ.(type) {
+	case *ast.StructType:
+		return exportedFields(t)
+	case *ast.Ident:
+		return c.namedStructFields(t.Name, fileAbs)
+	}
+	return nil
+}
+
+// indexTypeFields builds a per-package map of named struct types to their
+// exported fields, so namedStructFields is an O(1) lookup instead of a
+// linear scan over every file.
+func (c *checker) indexTypeFields() {
+	if c.typeFields != nil {
+		return
+	}
+	idx := make(map[string]map[string][]string)
+	for abs, f := range c.files {
+		importPath := c.fileImportPath[abs]
+		m := idx[importPath]
+		if m == nil {
+			m = make(map[string][]string)
+			idx[importPath] = m
+		}
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.TypeParams != nil {
+					continue
+				}
+				if st, ok := ts.Type.(*ast.StructType); ok {
+					m[ts.Name.Name] = exportedFields(st)
+				}
+			}
+		}
+	}
+	c.typeFields = idx
+}
+
+// namedStructFields returns the exported fields of the named struct type
+// declared in the same package as fileAbs, or nil when not found. Uses the
+// type index built by indexTypeFields; falls back to a linear scan when the
+// index is unavailable (direct-call tests).
+func (c *checker) namedStructFields(name, fileAbs string) []string {
+	if c.typeFields != nil {
+		return c.typeFields[c.fileImportPath[fileAbs]][name]
+	}
+	importPath := c.fileImportPath[fileAbs]
+	for abs, f := range c.files {
+		if c.fileImportPath[abs] != importPath {
+			continue
+		}
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Name.Name != name || ts.TypeParams != nil {
+					continue
+				}
+				if st, ok := ts.Type.(*ast.StructType); ok {
+					return exportedFields(st)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // isInitForIdent checks whether an ast.Expr is a bare reference to a
@@ -432,9 +613,33 @@ func exportedFields(st *ast.StructType) []string {
 
 // ── Report (write-detection) ────────────────────────────────────────────
 
+// indexEnums builds lookup maps for enum variables so write checks are O(1)
+// instead of a linear scan over every enum. Package-level variable names are
+// unique per package, so single-value maps suffice.
+func (c *checker) indexEnums() {
+	if c.enumByPkgVar != nil {
+		return
+	}
+	c.enumByPkgVar = make(map[string]map[string]enumIdent)
+	c.enumByImportVar = make(map[string]map[string]enumIdent)
+	for _, en := range c.enums {
+		if m := c.enumByPkgVar[en.pkg]; m != nil {
+			m[en.variable] = en
+		} else {
+			c.enumByPkgVar[en.pkg] = map[string]enumIdent{en.variable: en}
+		}
+		if m := c.enumByImportVar[en.importPath]; m != nil {
+			m[en.variable] = en
+		} else {
+			c.enumByImportVar[en.importPath] = map[string]enumIdent{en.variable: en}
+		}
+	}
+}
+
 // report inspects every cached file for writes to discovered enum
 // variables and their exported fields.
 func (c *checker) report() []string {
+	c.indexEnums()
 	for abs, f := range c.files {
 		c.checkFileWrites(f, abs)
 	}
@@ -552,14 +757,12 @@ func (c *checker) checkWriteExpr(expr ast.Expr, filePkg, fileAbs string, pos tok
 		if local[e.Name] {
 			return
 		}
-		for _, en := range c.enums {
-			if en.pkg == filePkg && en.variable == e.Name {
-				c.violations = append(c.violations, violation{
-					pos:    c.fset.Position(pos),
-					kind:   "variable",
-					target: en.variable,
-				})
-			}
+		if en, ok := c.enumByPkgVar[filePkg][e.Name]; ok {
+			c.violations = append(c.violations, violation{
+				pos:    c.positionFor(fileAbs, pos),
+				kind:   "variable",
+				target: en.variable,
+			})
 		}
 	case *ast.SelectorExpr:
 		// Two cases:
@@ -576,15 +779,13 @@ func (c *checker) checkFieldWrite(sel *ast.SelectorExpr, filePkg, fileAbs string
 	// through a package qualifier (e.g. `role.Permissions = ...`).
 	if x, ok := sel.X.(*ast.Ident); ok && !local[x.Name] {
 		importedPkg := c.resolveImport(fileAbs, x.Name)
-		for _, en := range c.enums {
-			if en.variable == field && en.importPath == importedPkg {
-				c.violations = append(c.violations, violation{
-					pos:    c.fset.Position(pos),
-					kind:   "variable",
-					target: x.Name + "." + en.variable,
-				})
-				return
-			}
+		if en, ok := c.enumByImportVar[importedPkg][field]; ok {
+			c.violations = append(c.violations, violation{
+				pos:    c.positionFor(fileAbs, pos),
+				kind:   "variable",
+				target: x.Name + "." + en.variable,
+			})
+			return
 		}
 	}
 
@@ -593,17 +794,15 @@ func (c *checker) checkFieldWrite(sel *ast.SelectorExpr, filePkg, fileAbs string
 		if local[x.Name] {
 			return
 		}
-		for _, en := range c.enums {
-			if en.pkg == filePkg && en.variable == x.Name {
-				for _, f := range en.fields {
-					if f == field {
-						c.violations = append(c.violations, violation{
-							pos:    c.fset.Position(pos),
-							kind:   "field",
-							target: en.variable + "." + field,
-						})
-						return
-					}
+		if en, ok := c.enumByPkgVar[filePkg][x.Name]; ok {
+			for _, f := range en.fields {
+				if f == field {
+					c.violations = append(c.violations, violation{
+						pos:    c.positionFor(fileAbs, pos),
+						kind:   "field",
+						target: en.variable + "." + field,
+					})
+					return
 				}
 			}
 		}
@@ -614,17 +813,15 @@ func (c *checker) checkFieldWrite(sel *ast.SelectorExpr, filePkg, fileAbs string
 		if alias, ok := pkgSel.X.(*ast.Ident); ok {
 			varName := pkgSel.Sel.Name
 			importedPkg := c.resolveImport(fileAbs, alias.Name)
-			for _, en := range c.enums {
-				if en.variable == varName && en.importPath == importedPkg {
-					for _, f := range en.fields {
-						if f == field {
-							c.violations = append(c.violations, violation{
-								pos:    c.fset.Position(pos),
-								kind:   "field",
-								target: alias.Name + "." + varName + "." + field,
-							})
-							return
-						}
+			if en, ok := c.enumByImportVar[importedPkg][varName]; ok {
+				for _, f := range en.fields {
+					if f == field {
+						c.violations = append(c.violations, violation{
+							pos:    c.positionFor(fileAbs, pos),
+							kind:   "field",
+							target: alias.Name + "." + varName + "." + field,
+						})
+						return
 					}
 				}
 			}
